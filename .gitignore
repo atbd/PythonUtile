@@ -1,0 +1,10 @@
+*.pyc
+*.so
+*.tif
+*.tiff
+/images/
+*.res
+*.c
+*.o
+*.cpp
+*.pyd

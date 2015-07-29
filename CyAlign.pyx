@@ -4,25 +4,34 @@ from skimage.filters.rank import enhance_contrast
 from skimage.external.tifffile import imread,imsave
 from skimage.filters import gaussian_filter
 from skimage.color import rgb2gray
-#from skimage.feature import (match_descriptors, corner_harris, corner_peaks, ORB, plot_matches, CENSURE)
 from skimage.morphology import square
 from skimage.measure import ransac
 from skimage.transform import warp,AffineTransform
-#from cv2 import warpAffine, getAffineTransform, estimateRigidTransform, findHomography, perspectiveTransform, warpPerspective
 import cv2
 import numpy as np
 cimport numpy as np
 import matplotlib.pyplot as plt
-#from scipy.spatial.distance import euclidean
 from os import listdir
 from itertools import ifilter
 from math import sqrt
 from r import *
 from cpython cimport bool
-#from cython.parallel cimport parallel,prange
-#import random as rnd
-#from PointMatch import *
-#from Model import *
+
+
+# Fonctions lambdas utiles
+b = lambda x,tmp: tmp if tmp > x else x
+c = lambda x,tmp: tmp if tmp < x else x
+
+r = lambda k: np.where(k > 0)[0]
+q = lambda k,v: r(k) if v.size == 0 else v
+s = lambda k: k.size != 0
+#s = lambda k: len(k) >= 200
+
+# TODO:régler le problème du min/max, changer le facteur d'arrêt s...
+o = lambda x,y: min(np.min(x),np.min(y)) #normalement max(np.min(x),np.min(y))
+z = lambda x,y: max(np.max(x),np.max(y)) #normalement min(max,max)
+
+
 
 def tracer(im):
     """ Cette fonction trace une image dans une nouvelle fenêtre.
@@ -36,7 +45,7 @@ def tracer(im):
     plt.axis('off')
     plt.show()
     
-cdef np.ndarray[np.uint8_t, ndim=2] normaliser(np.ndarray im):
+def normaliser(im, seize=False):
     """ Cette fonction normalise les niveaux de gris d'une image, remet son max à 255 et les autres niveaux en conséquence.
     
     Args:
@@ -45,30 +54,48 @@ cdef np.ndarray[np.uint8_t, ndim=2] normaliser(np.ndarray im):
     Returns:
         L'image normalisée (np.ndarray).
     """
+    mx = (1 << 8) - 1 if not seize else (1 << 16) - 1
+    im = (mx/np.max(im))*im
+    return im.astype(np.uint8) if not seize else im.astype(np.uint16)
 
-    im = (255./np.max(im))*im
-    return im.astype(np.uint8)
+
+cdef bonnesLignes(np.ndarray im):
+    """ Cette fonction recherche les lignes extrèmes non-vides sur les images.
+    Args:
+        im: image dont on doit trouver les bonnes lignes. 
+    Returns:
+        Retourne le tableau des indexs non-nuls.
+    """
+
+    cdef np.ndarray x1 = np.zeros((0)),x2 = np.zeros((0)),y1 = np.zeros((0)),y2 = np.zeros((0))
+    cdef int j=0
+
+    while True:
+        x1, y1 = q(im[:,j], x1), q(im[j,:], y1)
+        x2, y2 = q(im[:, -(j+1)], x2), q(im[-(j+1),:], y2)
+
+        if (s(x1) and s(x2) and s(y1) and s(y2)):
+            break
+        
+        j+=1
+
+    return o(x1,x2), z(x1,x2), o(y1,y2), z(y1,y2)
 
 
-cdef class AlignStack:
 
+
+
+
+cdef class ParentRecEtPano:
     # private
-    cdef np.ndarray stack
-    cdef int max_trials, minSetSize
-    cdef float initial_sigma, min_epsilon, max_epsilon, min_inlier_ratio
-    
-    # public
-    cdef public np.ndarray stackAligne
+    cdef float initial_sigma
+    cdef object b, bf
 
-    def __cinit__(self, pathStack):
-        self.stack = self.choixDossierEtStack(pathStack).astype(float)
-        self.stackAligne = np.zeros((0))
-        self.max_trials = 10000
+    def __cinit__(self):
         self.initial_sigma = 1.6
-        self.min_epsilon = 2.
-        self.max_epsilon = 100.
-        self.min_inlier_ratio = 0.05
-        self.minSetSize = 4
+        self.b = cv2.SURF()
+        self.bf = cv2.BFMatcher()
+   
 
 
     def sauvegardeInfosTif(self, pathIm, pathFichier=''):
@@ -86,6 +113,73 @@ cdef class AlignStack:
             dataTifHDF5(tmp, pathFichier)
 
         return tmp
+   
+
+
+    cdef pointsInterets(self, np.ndarray imOne, np.ndarray imTwo):
+        cdef np.ndarray im1,im2,d1,d2
+        cdef list good, g1, g2, k1, k2, matches
+
+        uno = lambda x: 255.*gaussian_filter(x, sqrt(self.initial_sigma**2 - 0.25))
+        dos = lambda x: enhance_contrast(normaliser(x),square(5))
+
+        im1,im2 = uno(imOne), uno(imTwo)
+        im1,im2 = dos(im1), dos(im2)
+        im1,im2 = normaliser(im1), normaliser(im2)
+        
+        k1,d1 = self.b.detectAndCompute(im1,None)
+        k2,d2 = self.b.detectAndCompute(im2,None)
+        
+        matches = self.bf.knnMatch(d1,d2, k=2)
+
+        # ratio test
+        good = []
+        for m,n in matches:
+            if m.distance < 0.75*n.distance:
+                good.append(m)
+        
+        g1,g2 = [],[]
+        for i in good:
+            g1.append(k1[i.queryIdx].pt)
+            g2.append(k2[i.trainIdx].pt)
+
+        return g1,g2
+    
+
+    cdef spc(self):
+        pass
+
+    cdef cropage(self):
+        pass
+
+    def run(self):
+        self.spc()
+        self.cropage()
+     
+    
+cdef class AlignStack(ParentRecEtPano):
+
+    # private
+    cdef np.ndarray stack
+    cdef int max_trials, minSetSize
+    cdef float min_epsilon, max_epsilon, min_inlier_ratio
+
+    
+    # public
+    cdef public np.ndarray stackAligne
+
+    def __cinit__(self, *args):
+        self.stack = self.choixDossierEtStack(args[0]).astype(float)
+        self.stackAligne = np.zeros((0))
+        
+        self.max_trials = 10000
+        self.min_epsilon = 2.
+        self.max_epsilon = 100.
+        self.min_inlier_ratio = 0.05
+        self.minSetSize = 4
+
+        ParentRecEtPano.__init__(self)
+
 
 
     def choixDossierEtStack(self, pathDossier):
@@ -93,7 +187,6 @@ cdef class AlignStack:
         
         Args:
             pathDossier: le chemin du dossier contenant les images.
-            tilt: pour le tri, si ce sont des images avec (tilt=xdeg) dans leurs noms.
         
         Returns:
             Le stack d'images recalées dans le sens croissant des angles.
@@ -129,79 +222,20 @@ cdef class AlignStack:
         
 
 
-    cdef np.ndarray[np.int64_t, ndim=1] rechercheBonneLigne(self, int i, bool rmin=True, bool rx=True):
-        """ Cette fonction recherche les lignes extrèmes non-vides sur les images.
-        Args:
-            i: numero de l'image dans le stack.
-            rmin: si True recherche le min sinon le max.
-            rx: si True recherche les limites x sinon y.
-        Returns:
-            Retourne le tableau des indexs non-nuls.
-        """
-        cdef np.ndarray[np.float_t, ndim=2] tmp = self.stack[i,...]
-        cdef np.ndarray[np.int64_t, ndim=1] r
-        cdef int j = 0
-        
-        if rmin:
-            if rx:
-                while True:
-                    r = np.where(tmp[:,j] > 0)[0]
-                    if r.size != 0:
-                        break
-                    j+=1
-            else:
-                while True:
-                    r=np.where(tmp[j,:] > 0)[0]
-                    if r.size != 0:
-                        break
-                    j+=1
-        else:
-            if rx:
-                while True:
-                    r = np.where(tmp[:,-(j+1)] > 0)[0]
-                    if r.size != 0:
-                        break
-                    j+=1
-            else:
-                while True:
-                    r=np.where(tmp[-(j+1),:] > 0)[0]
-                    if r.size != 0:
-                        break
-                    j+=1
-        
-        return r
-
-
     cdef cropage(self):
         """ Cette fonction recherche les 4 limites extrèmes sur les images du stack puis crope le stack et stocke le résultat dans stackAligne."""
         # Initialisation
         cdef unsigned int minx = 0, maxx = self.stack.shape[1], miny = 0, maxy = self.stack.shape[2]
         cdef int i = 0, lStack = len(self.stack)
         cdef unsigned int tmp_minx, tmp_maxx, tmp_miny, tmp_maxy
-        cdef np.ndarray[np.int64_t, ndim=1] x1,x2,y1,y2
 
         # Calcul des bornes
         for i in xrange(lStack):
-            x1 = self.rechercheBonneLigne(i, rmin=True, rx=True)
-            x2 = self.rechercheBonneLigne(i, rmin=False, rx=True)
-            y1 = self.rechercheBonneLigne(i, rmin=True, rx=False)
-            y2 = self.rechercheBonneLigne(i, rmin=False, rx=False)
-
-            tmp_minx, tmp_maxx, tmp_miny, tmp_maxy = min(np.min(x1), np.min(x2)), max(np.max(x1),np.max(x2)), min(np.min(y1), np.min(y2)), max(np.max(y1),np.max(y2))
+            tmp_minx, tmp_maxx, tmp_miny, tmp_maxy = bonnesLignes(self.stack[i,...])
 
             # On ne garde que les limites extrèmes du stack
-            if tmp_minx > minx:
-                minx = tmp_minx
-
-            if tmp_miny > miny:
-                miny = tmp_miny
-
-            if tmp_maxx < maxx:
-                maxx = tmp_maxx
-
-            if tmp_maxy < maxy:
-                maxy = tmp_maxy
-
+            minx, miny, maxx, maxy = b(minx, tmp_minx), b(miny, tmp_miny), c(maxx,tmp_maxx), c(maxy, tmp_maxy)
+           
         # Initialisation du stackAligne à la bonne taille
         self.stackAligne = np.zeros((lStack, maxx-minx, maxy-miny))
 
@@ -212,70 +246,70 @@ cdef class AlignStack:
         self.stackAligne = self.stackAligne.astype(np.uint8)
 
 
-
-    cdef recadrage(self):
+    cdef spc(self): # recadrage
         """ Cette fonction recadre les images grâce à SURF et RANSAC."""
         cdef unsigned int lStack = len(self.stack) - 1, x = 0
-        cdef np.ndarray im1,im2,d1,d2
         cdef object b = cv2.SURF(), bf = cv2.BFMatcher(), model
-        cdef list good, g1, g2, k1, k2, matches
-        
+        cdef list g1,g2
+
         for x in xrange(lStack):
             print('Traitement image ' + str(x+1))
-            
-            im1,im2 = 255.*gaussian_filter(self.stack[x,...], sqrt(self.initial_sigma**2 - 0.25)), 255.*gaussian_filter(self.stack[x+1,...], sqrt(self.initial_sigma**2 - 0.25))
-            im1,im2 = enhance_contrast(normaliser(im1), square(5)), enhance_contrast(normaliser(im2), square(5))
-            im1,im2 = normaliser(im1), normaliser(im2)
-            
-            #b = cv2.SURF()
-            #b = cv2.SIFT()
-            
-            k1,d1 = b.detectAndCompute(im1,None)
-            k2,d2 = b.detectAndCompute(im2,None)
-            
-            #bf = cv2.BFMatcher()
-            matches = bf.knnMatch(d1,d2, k=2)
 
-            # Apply ratio test
-            good = []
-            for m,n in matches:
-                if m.distance < 0.75*n.distance:
-                    good.append(m)
-            
-            g1,g2 = [],[]
-            for i in good:
-                g1.append(k1[i.queryIdx].pt)
-                g2.append(k2[i.trainIdx].pt)
+            g1, g2 = self.pointsInterets(self.stack[x,...], self.stack[x+1,...])
 
             model, _ = ransac((np.array(g1), np.array(g2)), AffineTransform, min_samples=3, residual_threshold=self.min_epsilon, max_trials=self.max_trials, stop_residuals_sum=self.min_inlier_ratio)
             
             self.stack[x+1,...] = warp(self.stack[x+1,...], AffineTransform(rotation=model.rotation, translation=model.translation), output_shape=self.stack[x+1].shape)
 
 
+
+           
+# TODO: Pano fonctionne pour deux images, tester pour 3+     
+cdef class Pano(ParentRecEtPano):
+    cdef list ims
+    cdef public np.ndarray res
+
+    def __cinit__(self, *args):
+        # args contiendra les images à panoramiser
+        ParentRecEtPano.__init__(self)
+
+        self.ims = []
+        for arg in args:
+            self.ims.append(normaliser(arg))
+
+        self.res = self.ims[0]
         
-    cpdef run(self):
-        self.recadrage()
-        self.cropage()
-        imsave("test.tif", self.stackAligne)
-            
+        
+    cpdef spc(self): # pano
+        cdef unsigned int x = 0
+        cdef list g1, g2
+        cdef np.ndarray H
+
+        for x in xrange(len(self.ims) - 1):
+            g2,g1 = self.pointsInterets(self.res, self.ims[x+1])
+            H, _ = cv2.findHomography(np.array(g1),np.array(g2),8) # CV_Ransac = 8
+            result = cv2.warpPerspective(self.ims[x+1], H, (self.res.shape[1] + self.ims[x+1].shape[1], self.ims[x].shape[0]))
+            result[...,:self.ims[x].shape[1]] = self.res
+            self.res = result
+            self.cropage() 
+
+
+    cpdef cropage(self):
+        cdef unsigned int Minx, Maxx, Miny, Maxy
+        cdef unsigned int minx = 0, maxx = self.res.shape[0], miny = 0, maxy = self.res.shape[1]
+
+        Minx, Maxx, Miny, Maxy = bonnesLignes(self.res)
+        self.res = self.res[Minx:Maxx, Miny:Maxy]
+
+
+        
+        
+        
+       
+        
         
         
         
         
         
 
-
-        
-        
-        
-        
-
-        
-        
-        
-        
-        
-        
-        
-        
-        
